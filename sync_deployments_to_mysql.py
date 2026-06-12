@@ -154,7 +154,7 @@ def _build_mysql_engine(host: str, port: int):
         pool_pre_ping=True,
         pool_recycle=300,
         poolclass=NullPool,
-        connect_args={"connect_timeout": 5, "read_timeout": 30, "write_timeout": 30},
+        connect_args={"connect_timeout": 30, "read_timeout": 60, "write_timeout": 60},
     )
 
 
@@ -314,15 +314,34 @@ def fetch_mongo_deployments(valid_mongo_ids: set, query_start: datetime, query_e
 
 
 # ─── MySQL upsert ─────────────────────────────────────────────────────────────
-def upsert_deployments(engine, daily_counts: dict, tsa_map: dict):
+def upsert_deployments(engine, daily_counts: dict, tsa_map: dict, month_start: datetime, now: datetime):
     """
     Upsert deployment counts into deployments_daily.
     tsa_map: {mongo_id: (corporate_num, tsa_full_name, region)}
+
+    NOTE: We first DELETE all records for the current date range to ensure
+    stale data (e.g. old Agent/Hybride records) is removed when we switch
+    to Merchant-only filtering.
     """
     if not daily_counts:
         print("[MySQL] Aucun déploiement à insérer.")
         return
 
+    # ─── 1. DELETE existing data for the current month range ────────────────────
+    start_str = month_start.strftime("%Y-%m-%d")
+    end_str = now.strftime("%Y-%m-%d")
+    print(f"[MySQL] Suppression des anciennes données ({start_str} → {end_str}) …")
+    with engine.connect() as conn:
+        delete_sql = (
+            f"DELETE FROM `{TABLE_DEPLOYMENTS}` "
+            f"WHERE `deployment_date` >= '{start_str}' AND `deployment_date` <= '{end_str}'"
+        )
+        result = conn.execute(text(delete_sql))
+        conn.commit()
+        deleted = result.rowcount if hasattr(result, 'rowcount') else -1
+        print(f"  → {deleted} ligne(s) supprimée(s).")
+
+    # ─── 2. Build INSERT rows ─────────────────────────────────────────────────
     rows = []
     skipped = 0
     for (mongo_id, date_str), count in daily_counts.items():
@@ -347,7 +366,8 @@ def upsert_deployments(engine, daily_counts: dict, tsa_map: dict):
         print("[MySQL] Aucune ligne à écrire après mapping.")
         return
 
-    print(f"[MySQL] Upsert {len(rows)} lignes dans `{TABLE_DEPLOYMENTS}` …")
+    # ─── 3. INSERT (simple, no ON DUPLICATE needed since we deleted first) ─────
+    print(f"[MySQL] Insertion de {len(rows)} lignes dans `{TABLE_DEPLOYMENTS}` …")
     with engine.connect() as conn:
         total_batches = (len(rows) + BATCH_SIZE - 1) // BATCH_SIZE
         for i in range(0, len(rows), BATCH_SIZE):
@@ -356,16 +376,12 @@ def upsert_deployments(engine, daily_counts: dict, tsa_map: dict):
                 f"INSERT INTO `{TABLE_DEPLOYMENTS}` "
                 f"(`corporate_num`, `tsa_full_name`, `region`, `deployment_date`, `deployment_count`) VALUES\n"
                 + ",\n".join(batch)
-                + "\nON DUPLICATE KEY UPDATE"
-                + " `deployment_count`=VALUES(`deployment_count`),"
-                + " `tsa_full_name`=VALUES(`tsa_full_name`),"
-                + " `region`=VALUES(`region`)"
             )
             conn.execute(text(sql))
             conn.commit()
             print(f"  batch {i // BATCH_SIZE + 1}/{total_batches} OK")
 
-    print("[OK] Upsert terminé.")
+    print("[OK] Insertion terminée.")
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -429,7 +445,7 @@ def main(mode: str = "all"):
 
         # 8. Upsert to MySQL
         print(f"\n[MySQL] Écriture des données …")
-        upsert_deployments(engine, daily_counts, tsa_map)
+        upsert_deployments(engine, daily_counts, tsa_map, month_start, now)
 
         elapsed = (datetime.now() - start_time).total_seconds()
         print(f"\n[DONE] Sync terminé en {elapsed:.1f}s.")
