@@ -8,6 +8,10 @@ var MYSQL_DATABASE = 'lka_tsa_deployments';
 var SHEET_SUMMARY = 'Summary (Monthly)';
 var SHEET_DAILY   = 'Daily Details';
 
+// Drive folder + monthly report config
+var REPORTS_FOLDER_NAME = 'TSA Performance Reports';
+var REPORT_NAME_PREFIX  = 'TSA Performance - '; // + YYYY-MM
+
 var MAX_JDBC_ATTEMPTS  = 5;
 var JDBC_BASE_DELAY_MS = 2000;
 
@@ -74,11 +78,90 @@ function getOrCreateSheet(ss, name) {
   return sheet;
 }
 
+// ─── Drive folder + monthly report management ────────────────────────────────
+
+/** Returns (creating if needed) the Drive folder that stores monthly reports. */
+function getReportsFolder() {
+  var props = PropertiesService.getScriptProperties();
+  var folderId = props.getProperty('REPORTS_FOLDER_ID');
+  if (folderId) {
+    try {
+      return DriveApp.getFolderById(folderId);
+    } catch (e) {
+      console.log('Dossier Drive introuvable (recréation) : ' + e.message);
+    }
+  }
+  var folder;
+  var existing = DriveApp.getFoldersByName(REPORTS_FOLDER_NAME);
+  if (existing.hasNext()) {
+    folder = existing.next();
+  } else {
+    folder = DriveApp.createFolder(REPORTS_FOLDER_NAME);
+    console.log('Dossier Drive créé : ' + REPORTS_FOLDER_NAME);
+  }
+  props.setProperty('REPORTS_FOLDER_ID', folder.getId());
+  return folder;
+}
+
+/**
+ * Returns the monthly report spreadsheet for monthKey (YYYY-MM).
+ * Reuses the existing one (cached id → name search), or creates a new one
+ * inside the reports folder.
+ */
+function getMonthlyReport(monthKey) {
+  var reportName = REPORT_NAME_PREFIX + monthKey;
+  var props = PropertiesService.getScriptProperties();
+  var cacheKey = 'REPORT_ID_' + monthKey;
+
+  var reportId = props.getProperty(cacheKey);
+  if (reportId) {
+    try {
+      return SpreadsheetApp.openById(reportId);
+    } catch (e) {
+      console.log('Rapport mensuel caché introuvable (recherche) : ' + e.message);
+    }
+  }
+
+  var folder = getReportsFolder();
+  var files = folder.getFilesByName(reportName);
+  var ss;
+  if (files.hasNext()) {
+    ss = SpreadsheetApp.openById(files.next().getId());
+  } else {
+    ss = SpreadsheetApp.create(reportName);
+    var file = DriveApp.getFileById(ss.getId());
+    folder.addFile(file);
+    DriveApp.getRootFolder().removeFile(file);
+    // Remove the default empty "Sheet1" later once our tabs exist
+    console.log('Nouveau rapport mensuel créé : ' + reportName);
+  }
+  props.setProperty(cacheKey, ss.getId());
+  return ss;
+}
+
+/** Drops the default empty sheet (Sheet1 / Feuille1) if our tabs exist. */
+function dropDefaultSheet(ss) {
+  var defaults = ['Sheet1', 'Feuille1', 'Feuille 1'];
+  for (var i = 0; i < defaults.length; i++) {
+    var s = ss.getSheetByName(defaults[i]);
+    if (s && ss.getSheets().length > 1) {
+      ss.deleteSheet(s);
+    }
+  }
+}
+
 // ─── Date helpers ─────────────────────────────────────────────────────────────
 
-function getMonthStart() {
+/**
+ * Returns the date range for a month. offset 0 = current month, -1 = previous.
+ * { start: Date (1st 00:00), end: Date (1st of next month 00:00), key: 'YYYY-MM' }
+ */
+function getMonthRange(offset) {
   var now = new Date();
-  return new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0);
+  var start = new Date(now.getFullYear(), now.getMonth() + offset, 1, 0, 0, 0);
+  var end   = new Date(now.getFullYear(), now.getMonth() + offset + 1, 1, 0, 0, 0);
+  var key   = start.getFullYear() + '-' + String(start.getMonth() + 1).padStart(2, '0');
+  return { start: start, end: end, key: key };
 }
 
 function toDateStr(d) {
@@ -95,7 +178,7 @@ function toDateStr(d) {
  *   transmissionsByCorpNum  : { corporateNum → count }  (for Summary)
  *   transmissionsByDay      : { "YYYY-MM-DD|corporateNum" → count }  (for Daily)
  */
-function readTransmissions(ss) {
+function readTransmissions(ss, range) {
   var sheet = getFormResponsesSheet(ss);
   var data = sheet.getDataRange().getValues();
 
@@ -130,9 +213,6 @@ function readTransmissions(ss) {
     return { byCorpNum: {}, byDay: {} };
   }
 
-  var monthStart = getMonthStart();
-  var now = new Date();
-
   var byCorpNum = {};
   var byDay = {};
 
@@ -140,10 +220,11 @@ function readTransmissions(ss) {
     var rawTs = data[row][idxTimestamp];
     if (!rawTs) continue;
     var ts = new Date(rawTs);
-    if (ts < monthStart || ts > now) continue;
+    if (ts < range.start || ts >= range.end) continue;
 
     var corpNum = String(data[row][idxCorpNum]).trim();
-    if (!corpNum || corpNum === '' || corpNum.toLowerCase() === 'undefined') continue;
+    if (!corpNum || corpNum === '' || corpNum === '0' ||
+        corpNum.toLowerCase() === 'undefined') continue;
 
     // Summary count
     byCorpNum[corpNum] = (byCorpNum[corpNum] || 0) + 1;
@@ -165,16 +246,18 @@ function readTransmissions(ss) {
  *   deploymentsByDay     : { "YYYY-MM-DD|corporateNum" → count }
  *   tsaInfo              : { corporateNum → { name, region } }
  */
-function readMySQLData() {
+function readMySQLData(range) {
+  var startStr = toDateStr(range.start);
+  var endStr   = toDateStr(range.end);
   var conn = null;
   try {
     conn = getMySQLConnection();
 
-    // Query 1: deployments summary (current month)
+    // Query 1: deployments summary (month range)
     var sqlDeplSummary =
       "SELECT corporate_num, tsa_full_name, region, SUM(deployment_count) AS total " +
       "FROM deployments_daily " +
-      "WHERE deployment_date >= DATE_FORMAT(NOW(), '%Y-%m-01') " +
+      "WHERE deployment_date >= '" + startStr + "' AND deployment_date < '" + endStr + "' " +
       "GROUP BY corporate_num, tsa_full_name, region";
 
     var rsDeplSummary = queryWithRetry(conn, sqlDeplSummary);
@@ -190,11 +273,11 @@ function readMySQLData() {
     }
     rsDeplSummary.close();
 
-    // Query 2: deployments daily detail (current month)
+    // Query 2: deployments daily detail (month range)
     var sqlDeplDaily =
       "SELECT deployment_date, corporate_num, deployment_count " +
       "FROM deployments_daily " +
-      "WHERE deployment_date >= DATE_FORMAT(NOW(), '%Y-%m-01') " +
+      "WHERE deployment_date >= '" + startStr + "' AND deployment_date < '" + endStr + "' " +
       "ORDER BY deployment_date ASC";
 
     var rsDeplDaily = queryWithRetry(conn, sqlDeplDaily);
@@ -239,147 +322,198 @@ function readMySQLData() {
 
 // ─── Format helpers ───────────────────────────────────────────────────────────
 
-function formatHeaders(sheet, numCols) {
-  var headerRange = sheet.getRange(1, 1, 1, numCols);
-  headerRange.setFontWeight('bold');
-  headerRange.setBackground('#1a73e8');
-  headerRange.setFontColor('#ffffff');
-  headerRange.setHorizontalAlignment('center');
-  sheet.setFrozenRows(1);
-}
+/**
+ * Applies clean styling to a freshly-written sheet.
+ *   numRows     : total rows including header
+ *   numCols     : number of columns
+ *   numericCols : array of 1-based column indices to center (numbers)
+ *   widths      : array of {col, width} for fixed column widths
+ *   updatedAt   : Date for the "last updated" note on A1
+ */
+function styleSheet(sheet, numRows, numCols, numericCols, widths, updatedAt) {
+  // Remove any leftover bandings (avoids accumulation across runs)
+  var bandings = sheet.getBandings();
+  for (var b = 0; b < bandings.length; b++) {
+    bandings[b].remove();
+  }
 
-function autoResizeColumns(sheet, numCols) {
-  for (var i = 1; i <= numCols; i++) {
-    sheet.autoResizeColumn(i);
+  // Base font on the whole used range
+  var used = sheet.getRange(1, 1, Math.max(numRows, 1), numCols);
+  used.setFontFamily('Arial').setFontSize(10).setVerticalAlignment('middle');
+
+  // Header row
+  var header = sheet.getRange(1, 1, 1, numCols);
+  header.setFontWeight('bold')
+        .setBackground('#1a73e8')
+        .setFontColor('#ffffff')
+        .setHorizontalAlignment('center');
+  sheet.setRowHeight(1, 30);
+  sheet.setFrozenRows(1);
+
+  // Data area: borders + alternating banding
+  if (numRows > 1) {
+    var dataRange = sheet.getRange(2, 1, numRows - 1, numCols);
+    dataRange.applyRowBanding(SpreadsheetApp.BandingTheme.LIGHT_GREY, false, false);
+    used.setBorder(true, true, true, true, true, true,
+                   '#dddddd', SpreadsheetApp.BorderStyle.SOLID);
+  }
+
+  // Numeric columns centered
+  if (numericCols && numRows > 1) {
+    for (var i = 0; i < numericCols.length; i++) {
+      sheet.getRange(2, numericCols[i], numRows - 1, 1).setHorizontalAlignment('center');
+    }
+  }
+
+  // Fixed column widths
+  if (widths) {
+    for (var w = 0; w < widths.length; w++) {
+      sheet.setColumnWidth(widths[w].col, widths[w].width);
+    }
+  }
+
+  // "Last updated" note on A1 (clean, no overflow)
+  if (updatedAt) {
+    sheet.getRange(1, 1).setNote('Mis à jour : ' + updatedAt.toLocaleString('fr-FR'));
   }
 }
 
-// ─── Update Summary (Monthly) tab ─────────────────────────────────────────────
+// ─── Write Summary (Monthly) tab ──────────────────────────────────────────────
 
-function updateSummarySheet() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var transmissions = readTransmissions(ss);
-  var mysqlData = readMySQLData();
-
-  var byCorpNum    = transmissions.byCorpNum;
+function writeSummary(reportSS, transmissions, mysqlData, updatedAt) {
+  var byCorpNum     = transmissions.byCorpNum;
   var deplByCorpNum = mysqlData.deploymentsByCorpNum;
-  var tsaInfo      = mysqlData.tsaInfo;
+  var tsaInfo       = mysqlData.tsaInfo;
 
-  // Build union of all corporate numbers
-  var allCorpNums = {};
-  Object.keys(byCorpNum).forEach(function(k)    { allCorpNums[k] = true; });
-  Object.keys(deplByCorpNum).forEach(function(k) { allCorpNums[k] = true; });
-  Object.keys(tsaInfo).forEach(function(k)       { allCorpNums[k] = true; });
-
+  // Display only TSA present in the reference (tsaInfo) → no phantom rows.
   var rows = [['TSA', 'Region', 'Transmissions', 'Deployments done']];
 
-  var sortedCorpNums = Object.keys(allCorpNums).sort(function(a, b) {
-    var nameA = (tsaInfo[a] && tsaInfo[a].name) ? tsaInfo[a].name : a;
-    var nameB = (tsaInfo[b] && tsaInfo[b].name) ? tsaInfo[b].name : b;
+  var corpNums = Object.keys(tsaInfo).sort(function(a, b) {
+    var nameA = tsaInfo[a].name || a;
+    var nameB = tsaInfo[b].name || b;
     return nameA.localeCompare(nameB);
   });
 
-  for (var i = 0; i < sortedCorpNums.length; i++) {
-    var corp = sortedCorpNums[i];
-    var info = tsaInfo[corp] || { name: corp, region: '' };
+  for (var i = 0; i < corpNums.length; i++) {
+    var corp = corpNums[i];
+    var info = tsaInfo[corp];
     rows.push([
       info.name || corp,
       info.region || '',
-      byCorpNum[corp]    || 0,
+      byCorpNum[corp]     || 0,
       deplByCorpNum[corp] || 0
     ]);
   }
 
-  var sheet = getOrCreateSheet(ss, SHEET_SUMMARY);
-  sheet.clearContents();
-  if (rows.length > 0) {
-    sheet.getRange(1, 1, rows.length, 4).setValues(rows);
-  }
-  formatHeaders(sheet, 4);
-  autoResizeColumns(sheet, 4);
+  var sheet = getOrCreateSheet(reportSS, SHEET_SUMMARY);
+  sheet.clear();
+  sheet.getRange(1, 1, rows.length, 4).setValues(rows);
 
-  // Update timestamp in cell F1
-  sheet.getRange(1, 6).setValue('Mis à jour : ' + new Date().toLocaleString('fr-FR'));
+  styleSheet(
+    sheet, rows.length, 4,
+    [3, 4],
+    [{ col: 1, width: 260 }, { col: 2, width: 120 },
+     { col: 3, width: 120 }, { col: 4, width: 150 }],
+    updatedAt
+  );
 
   console.log('[Summary] ' + (rows.length - 1) + ' TSA écrits.');
 }
 
-// ─── Update Daily Details tab ─────────────────────────────────────────────────
+// ─── Write Daily Details tab ──────────────────────────────────────────────────
 
-function updateDailyDetailsSheet() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var transmissions = readTransmissions(ss);
-  var mysqlData = readMySQLData();
-
-  var byDay    = transmissions.byDay;
+function writeDaily(reportSS, transmissions, mysqlData, updatedAt) {
+  var byDay     = transmissions.byDay;
   var deplByDay = mysqlData.deploymentsByDay;
-  var tsaInfo  = mysqlData.tsaInfo;
+  var tsaInfo   = mysqlData.tsaInfo;
 
-  // Build union of all (date|corpNum) keys
+  // Union of all (date|corpNum) keys, skipping corp not in reference.
   var allKeys = {};
-  Object.keys(byDay).forEach(function(k)    { allKeys[k] = true; });
+  Object.keys(byDay).forEach(function(k)     { allKeys[k] = true; });
   Object.keys(deplByDay).forEach(function(k) { allKeys[k] = true; });
 
   var rows = [['Date', 'TSA', 'Region', 'Transmissions', 'Deployments']];
 
   var sortedKeys = Object.keys(allKeys).sort();
-
   for (var i = 0; i < sortedKeys.length; i++) {
-    var key = sortedKeys[i];
+    var key   = sortedKeys[i];
     var parts = key.split('|');
     var dateStr = parts[0];
     var corp    = parts[1];
-    var info    = tsaInfo[corp] || { name: corp, region: '' };
+    var info    = tsaInfo[corp];
+    if (!info) continue; // skip unknown corp (phantom)
     rows.push([
       dateStr,
       info.name || corp,
       info.region || '',
-      byDay[key]    || 0,
+      byDay[key]     || 0,
       deplByDay[key] || 0
     ]);
   }
 
-  var sheet = getOrCreateSheet(ss, SHEET_DAILY);
-  sheet.clearContents();
-  if (rows.length > 0) {
-    sheet.getRange(1, 1, rows.length, 5).setValues(rows);
-  }
-  formatHeaders(sheet, 5);
-  autoResizeColumns(sheet, 5);
+  var sheet = getOrCreateSheet(reportSS, SHEET_DAILY);
+  sheet.clear();
+  sheet.getRange(1, 1, rows.length, 5).setValues(rows);
 
-  // Update timestamp in cell G1
-  sheet.getRange(1, 7).setValue('Mis à jour : ' + new Date().toLocaleString('fr-FR'));
+  styleSheet(
+    sheet, rows.length, 5,
+    [4, 5],
+    [{ col: 1, width: 110 }, { col: 2, width: 260 }, { col: 3, width: 120 },
+     { col: 4, width: 120 }, { col: 5, width: 120 }],
+    updatedAt
+  );
 
   console.log('[Daily] ' + (rows.length - 1) + ' lignes écrites.');
 }
 
-// ─── Monthly reset ────────────────────────────────────────────────────────────
+// ─── Report orchestrator ──────────────────────────────────────────────────────
 
-function clearPreviousMonthData() {
-  var now = new Date();
-  if (now.getDate() !== 1) return;
+/**
+ * Builds (or refreshes) the monthly report for the given offset.
+ *   offset 0  = current month
+ *   offset -1 = previous month (finalization)
+ * Reads transmissions from the bound Form Responses sheet and deployments
+ * from MySQL, then writes the Summary + Daily tabs into the month's dedicated
+ * spreadsheet stored in the Drive reports folder.
+ */
+function buildReport(offset) {
+  var range  = getMonthRange(offset);
+  var source = SpreadsheetApp.getActiveSpreadsheet();
+  var now    = new Date();
 
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var summary = ss.getSheetByName(SHEET_SUMMARY);
-  var daily   = ss.getSheetByName(SHEET_DAILY);
+  var transmissions = readTransmissions(source, range);
+  var mysqlData     = readMySQLData(range);
 
-  if (summary && summary.getLastRow() > 1) {
-    summary.getRange(2, 1, summary.getLastRow() - 1, summary.getLastColumn()).clearContent();
-    console.log('[Reset] Summary vidé.');
-  }
-  if (daily && daily.getLastRow() > 1) {
-    daily.getRange(2, 1, daily.getLastRow() - 1, daily.getLastColumn()).clearContent();
-    console.log('[Reset] Daily vidé.');
-  }
+  var reportSS = getMonthlyReport(range.key);
+  writeSummary(reportSS, transmissions, mysqlData, now);
+  writeDaily(reportSS, transmissions, mysqlData, now);
+  dropDefaultSheet(reportSS);
+
+  console.log('[Report ' + range.key + '] OK → ' + reportSS.getUrl());
+  return reportSS;
 }
+
+// ─── Manual helpers ───────────────────────────────────────────────────────────
+
+function updateCurrentMonth()    { return buildReport(0);  }
+function finalizePreviousMonth() { return buildReport(-1); }
 
 // ─── Main entry point (called by trigger) ────────────────────────────────────
 
 function runUpdate() {
   try {
-    clearPreviousMonthData();
-    updateSummarySheet();
-    updateDailyDetailsSheet();
+    // Always refresh the current month (auto-creates a new spreadsheet when
+    // the month rolls over).
+    buildReport(0);
+
+    // During the first 3 days of a new month, finalize the previous month's
+    // report so late-arriving data is captured before we stop touching it.
+    var now = new Date();
+    if (now.getDate() <= 3) {
+      buildReport(-1);
+      console.log('[Finalize] Rapport du mois précédent finalisé.');
+    }
+
     console.log('[DONE] Mise à jour terminée avec succès.');
   } catch (e) {
     console.error('[ERROR] runUpdate failed: ' + e.message + '\n' + e.stack);
@@ -412,6 +546,14 @@ function deleteAllTriggers() {
     ScriptApp.deleteTrigger(triggers[i]);
   }
   console.log('Tous les triggers supprimés.');
+}
+
+/** Logs the URL of the current month's report (creates it if missing). */
+function logCurrentReportUrl() {
+  var range = getMonthRange(0);
+  var ss = getMonthlyReport(range.key);
+  console.log('Rapport ' + range.key + ' : ' + ss.getUrl());
+  return ss.getUrl();
 }
 
 // ─── MySQL connectivity test ──────────────────────────────────────────────────
