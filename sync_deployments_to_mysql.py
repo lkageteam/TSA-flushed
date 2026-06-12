@@ -157,34 +157,18 @@ def _build_mysql_engine(host: str, port: int):
     )
 
 
-def get_mysql_engine():
-    """Try direct MySQL, fallback to SSH tunnel."""
-    engine = _build_mysql_engine(MYSQL_HOST, MYSQL_PORT)
+def _test_mysql_engine(engine) -> bool:
     try:
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
-        print("[MySQL] Connexion directe OK.")
-        return engine
-    except Exception as exc:
-        engine.dispose()
-        if not _is_connection_like_error(exc):
-            raise
-        print(f"[MySQL] Connexion directe échouée : {exc}")
-        if paramiko is None:
-            raise RuntimeError("MySQL direct échoué et paramiko absent.") from exc
-        print("[MySQL] Tentative via tunnel SSH...")
-        try:
-            with _open_mysql_ssh_tunnel(MYSQL_PORT) as local_port:
-                print(f"[SSH] Tunnel actif : 127.0.0.1:{local_port} → {SSH_HOST}:{MYSQL_PORT}")
-                engine = _build_mysql_engine("127.0.0.1", local_port)
-                with engine.connect() as conn:
-                    conn.execute(text("SELECT 1"))
-                print("[MySQL] Connexion via tunnel SSH OK.")
-                return engine
-        except Exception as tunnel_exc:
-            raise RuntimeError(
-                f"MySQL échoué (direct + tunnel SSH). Dernière erreur: {tunnel_exc}"
-            ) from tunnel_exc
+        return True
+    except Exception:
+        return False
+
+
+def get_mysql_engine():
+    """Build MySQL engine (caller must manage SSH tunnel if needed)."""
+    return _build_mysql_engine(MYSQL_HOST, MYSQL_PORT)
 
 
 # ─── Excel / TSA reference ────────────────────────────────────────────────────
@@ -390,42 +374,62 @@ def main():
     print(f"[START] sync_deployments_to_mysql — {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*60}\n")
 
-    # 1. Build MySQL engine (direct or SSH tunnel fallback)
+    # 1. Build MySQL engine
     engine = get_mysql_engine()
 
-    # 2. Load TSA reference from Excel
-    df_tsa = load_tsa_reference()
+    # 2. Test direct connection; fallback to SSH tunnel if needed
+    tunnel_ctx = None
+    if not _test_mysql_engine(engine):
+        engine.dispose()
+        if paramiko is None:
+            raise RuntimeError("MySQL direct échoué et paramiko absent.")
+        print(f"[MySQL] Connexion directe échouée, tentative via tunnel SSH...")
+        tunnel_ctx = _open_mysql_ssh_tunnel(MYSQL_PORT)
+        local_port = tunnel_ctx.__enter__()
+        print(f"[SSH] Tunnel actif : 127.0.0.1:{local_port} → {SSH_HOST}:{MYSQL_PORT}")
+        engine = _build_mysql_engine("127.0.0.1", local_port)
+        if not _test_mysql_engine(engine):
+            tunnel_ctx.__exit__(None, None, None)
+            raise RuntimeError("MySQL échoué via tunnel SSH.")
+        print("[MySQL] Connexion via tunnel SSH OK.")
 
-    # 3. Sync tsa_reference table
-    sync_tsa_reference(engine, df_tsa)
+    try:
+        # 3. Load TSA reference from Excel
+        df_tsa = load_tsa_reference()
 
-    # 4. Build lookup maps
-    # mongo_id → (corporate_num, tsa_full_name, region)
-    tsa_map = {}
-    for _, row in df_tsa.iterrows():
-        tsa_map[row["mongo_id"]] = (row["corporate_num"], row["tsa_full_name"], row["region"])
+        # 4. Sync tsa_reference table
+        sync_tsa_reference(engine, df_tsa)
 
-    valid_mongo_ids = set(tsa_map.keys())
-    print(f"[Info] {len(valid_mongo_ids)} mongo_ids valides pour la requête MongoDB.")
+        # 5. Build lookup maps
+        tsa_map = {}
+        for _, row in df_tsa.iterrows():
+            tsa_map[row["mongo_id"]] = (row["corporate_num"], row["tsa_full_name"], row["region"])
 
-    # 5. Monthly reset if applicable
-    maybe_reset_previous_month(engine)
+        valid_mongo_ids = set(tsa_map.keys())
+        print(f"[Info] {len(valid_mongo_ids)} mongo_ids valides pour la requête MongoDB.")
 
-    # 6. Date range: start of current month → now
-    now = datetime.now()
-    month_start = datetime(now.year, now.month, 1, 0, 0, 0)
-    print(f"[Info] Plage de requête : {month_start.strftime('%Y-%m-%d')} → {now.strftime('%Y-%m-%d %H:%M:%S')}")
+        # 6. Monthly reset if applicable
+        maybe_reset_previous_month(engine)
 
-    # 7. Fetch from MongoDB
-    print("\n[Mongo] Extraction des déploiements …")
-    daily_counts = fetch_mongo_deployments(valid_mongo_ids, month_start, now)
+        # 7. Date range: start of current month → now
+        now = datetime.now()
+        month_start = datetime(now.year, now.month, 1, 0, 0, 0)
+        print(f"[Info] Plage de requête : {month_start.strftime('%Y-%m-%d')} → {now.strftime('%Y-%m-%d %H:%M:%S')}")
 
-    # 8. Upsert to MySQL
-    print(f"\n[MySQL] Écriture des données …")
-    upsert_deployments(engine, daily_counts, tsa_map)
+        # 8. Fetch from MongoDB
+        print("\n[Mongo] Extraction des déploiements …")
+        daily_counts = fetch_mongo_deployments(valid_mongo_ids, month_start, now)
 
-    elapsed = (datetime.now() - start_time).total_seconds()
-    print(f"\n[DONE] Sync terminé en {elapsed:.1f}s.")
+        # 9. Upsert to MySQL
+        print(f"\n[MySQL] Écriture des données …")
+        upsert_deployments(engine, daily_counts, tsa_map)
+
+        elapsed = (datetime.now() - start_time).total_seconds()
+        print(f"\n[DONE] Sync terminé en {elapsed:.1f}s.")
+    finally:
+        if tunnel_ctx is not None:
+            tunnel_ctx.__exit__(None, None, None)
+            print("[SSH] Tunnel fermé.")
 
 
 if __name__ == "__main__":
