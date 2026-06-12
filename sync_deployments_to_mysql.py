@@ -4,20 +4,24 @@ MongoDB → MySQL sync script for TSA deployments.
 Reads deployment records from MongoDB `pos` collection for the current month
 and upserts daily counts into MySQL `deployments_daily` table.
 Also refreshes `tsa_reference` from TSA_List.xlsx on each run.
-Runs on server hourly via cron.
+Runs via GitHub Actions hourly.
 
 Usage: python sync_deployments_to_mysql.py
 """
 
 import math
+import select
+import socketserver
+import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
 import pymongo
 from dotenv import load_dotenv
-from sqlalchemy import text
+from sqlalchemy import create_engine, text
 from sqlalchemy.pool import NullPool
 
 load_dotenv(Path(__file__).parent / ".env")
@@ -27,9 +31,15 @@ sys.path.insert(0, str(Path(__file__).parent))
 from connections.config import (
     MONGO_URI, MONGO_DB_NAME,
     MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE,
+    SSH_HOST, SSH_USER, SSH_PASS, SSH_PORT,
     TABLE_DEPLOYMENTS, TABLE_TSA_REF,
-    REGION_NORMALIZATION, make_engine,
+    REGION_NORMALIZATION,
 )
+
+try:
+    import paramiko
+except ImportError:
+    paramiko = None
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 EXCEL_PATH = Path(__file__).parent / "TSA_List.xlsx"
@@ -53,6 +63,128 @@ def _is_connection_like_error(exc: Exception) -> bool:
         "econnreset", "econnrefused", "ehostunreach", "broken pipe",
     )
     return any(token in message for token in tokens)
+
+
+# ─── SSH tunnel helpers ───────────────────────────────────────────────────────
+class _TunnelForwardHandler(socketserver.BaseRequestHandler):
+    chain_host = "127.0.0.1"
+    chain_port = 3306
+    transport = None
+
+    def handle(self):
+        try:
+            channel = self.transport.open_channel(
+                "direct-tcpip",
+                (self.chain_host, self.chain_port),
+                self.request.getpeername(),
+            )
+        except Exception:
+            return
+        if channel is None:
+            return
+        try:
+            while True:
+                readers, _, _ = select.select([self.request, channel], [], [])
+                if self.request in readers:
+                    data = self.request.recv(1024)
+                    if not data:
+                        break
+                    channel.sendall(data)
+                if channel in readers:
+                    data = channel.recv(1024)
+                    if not data:
+                        break
+                    self.request.sendall(data)
+        finally:
+            channel.close()
+            self.request.close()
+
+
+class _ThreadingForwardServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+@contextmanager
+def _open_mysql_ssh_tunnel(remote_port: int = 3306):
+    if paramiko is None:
+        raise RuntimeError("Paramiko non installé, tunnel SSH impossible.")
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.connect(
+        hostname=SSH_HOST,
+        port=SSH_PORT,
+        username=SSH_USER,
+        password=SSH_PASS,
+        timeout=10,
+        auth_timeout=10,
+        banner_timeout=10,
+        look_for_keys=False,
+        allow_agent=False,
+    )
+    transport = client.get_transport()
+    if transport is None:
+        client.close()
+        raise RuntimeError("Transport SSH indisponible.")
+
+    class Handler(_TunnelForwardHandler):
+        pass
+
+    Handler.chain_host = "127.0.0.1"
+    Handler.chain_port = remote_port
+    Handler.transport = transport
+
+    server = _ThreadingForwardServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server.server_address[1]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+        client.close()
+
+
+def _build_mysql_engine(host: str, port: int):
+    db_url = f"mysql+pymysql://{MYSQL_USER}:{MYSQL_PASSWORD}@{host}:{port}/{MYSQL_DATABASE}?charset=utf8mb4"
+    return create_engine(
+        db_url,
+        pool_pre_ping=True,
+        pool_recycle=300,
+        poolclass=NullPool,
+        connect_args={"connect_timeout": 5, "read_timeout": 30, "write_timeout": 30},
+    )
+
+
+def get_mysql_engine():
+    """Try direct MySQL, fallback to SSH tunnel."""
+    engine = _build_mysql_engine(MYSQL_HOST, MYSQL_PORT)
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        print("[MySQL] Connexion directe OK.")
+        return engine
+    except Exception as exc:
+        engine.dispose()
+        if not _is_connection_like_error(exc):
+            raise
+        print(f"[MySQL] Connexion directe échouée : {exc}")
+        if paramiko is None:
+            raise RuntimeError("MySQL direct échoué et paramiko absent.") from exc
+        print("[MySQL] Tentative via tunnel SSH...")
+        try:
+            with _open_mysql_ssh_tunnel(MYSQL_PORT) as local_port:
+                print(f"[SSH] Tunnel actif : 127.0.0.1:{local_port} → {SSH_HOST}:{MYSQL_PORT}")
+                engine = _build_mysql_engine("127.0.0.1", local_port)
+                with engine.connect() as conn:
+                    conn.execute(text("SELECT 1"))
+                print("[MySQL] Connexion via tunnel SSH OK.")
+                return engine
+        except Exception as tunnel_exc:
+            raise RuntimeError(
+                f"MySQL échoué (direct + tunnel SSH). Dernière erreur: {tunnel_exc}"
+            ) from tunnel_exc
 
 
 # ─── Excel / TSA reference ────────────────────────────────────────────────────
@@ -258,15 +390,8 @@ def main():
     print(f"[START] sync_deployments_to_mysql — {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*60}\n")
 
-    # 1. Build MySQL engine
-    from sqlalchemy import create_engine
-    engine = create_engine(
-        f"mysql+pymysql://{MYSQL_USER}:{MYSQL_PASSWORD}@{MYSQL_HOST}:{MYSQL_PORT}/{MYSQL_DATABASE}?charset=utf8mb4",
-        pool_pre_ping=True,
-        pool_recycle=300,
-        poolclass=NullPool,
-        connect_args={"connect_timeout": 5, "read_timeout": 30, "write_timeout": 30},
-    )
+    # 1. Build MySQL engine (direct or SSH tunnel fallback)
+    engine = get_mysql_engine()
 
     # 2. Load TSA reference from Excel
     df_tsa = load_tsa_reference()

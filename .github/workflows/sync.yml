@@ -18,7 +18,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install pandas pymongo sqlalchemy pymysql python-dotenv openpyxl
+          pip install pandas pymongo sqlalchemy pymysql python-dotenv openpyxl paramiko
 
       - name: Run sync
         env:
@@ -29,4 +29,8 @@ jobs:
           MYSQL_USER: ${{ secrets.MYSQL_USER }}
           MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD }}
           MYSQL_DATABASE: ${{ secrets.MYSQL_DATABASE }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_PASS: ${{ secrets.SSH_PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
         run: python sync_deployments_to_mysql.py
