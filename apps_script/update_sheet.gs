@@ -388,12 +388,16 @@ function writeSummary(reportSS, transmissions, mysqlData, updatedAt) {
   var tsaInfo       = mysqlData.tsaInfo;
 
   // Display only TSA present in the reference (tsaInfo) → no phantom rows.
+  // Sort by deployments (descending), then by name (ascending).
   var rows = [['TSA', 'Region', 'Transmissions', 'Deployments done']];
 
   var corpNums = Object.keys(tsaInfo).sort(function(a, b) {
+    var deplA = deplByCorpNum[a] || 0;
+    var deplB = deplByCorpNum[b] || 0;
+    if (deplB !== deplA) return deplB - deplA; // desc deployments
     var nameA = tsaInfo[a].name || a;
     var nameB = tsaInfo[b].name || b;
-    return nameA.localeCompare(nameB);
+    return nameA.localeCompare(nameB); // asc name as tie-breaker
   });
 
   for (var i = 0; i < corpNums.length; i++) {
@@ -436,22 +440,34 @@ function writeDaily(reportSS, transmissions, mysqlData, updatedAt) {
 
   var rows = [['Date', 'TSA', 'Region', 'Transmissions', 'Deployments']];
 
-  var sortedKeys = Object.keys(allKeys).sort();
-  for (var i = 0; i < sortedKeys.length; i++) {
-    var key   = sortedKeys[i];
+  // Build array of objects for sorting by deployments (descending)
+  var rowObjs = [];
+  Object.keys(allKeys).forEach(function(key) {
     var parts = key.split('|');
     var dateStr = parts[0];
     var corp    = parts[1];
     var info    = tsaInfo[corp];
-    if (!info) continue; // skip unknown corp (phantom)
-    rows.push([
-      dateStr,
-      info.name || corp,
-      info.region || '',
-      byDay[key]     || 0,
-      deplByDay[key] || 0
-    ]);
-  }
+    if (!info) return; // skip unknown corp (phantom)
+    var depl = deplByDay[key] || 0;
+    var trans = byDay[key] || 0;
+    rowObjs.push({
+      date: dateStr,
+      name: info.name || corp,
+      region: info.region || '',
+      trans: trans,
+      depl: depl,
+      sortKey: -depl // negative for descending sort
+    });
+  });
+
+  rowObjs.sort(function(a, b) {
+    if (a.sortKey !== b.sortKey) return a.sortKey - b.sortKey;
+    return a.date.localeCompare(b.date); // tie-breaker: date ascending
+  });
+
+  rowObjs.forEach(function(obj) {
+    rows.push([obj.date, obj.name, obj.region, obj.trans, obj.depl]);
+  });
 
   var sheet = getOrCreateSheet(reportSS, SHEET_DAILY);
   sheet.clear();
@@ -528,14 +544,30 @@ function buildDashboard(reportSS) {
     return;
   }
 
-  // Parse daily data → { 'YYYY-MM' → { date → { trans, depl } } }
+  // Parse daily data → { 'YYYY-MM' → { 'YYYY-MM-DD' → { trans, depl } } }
+  // Group by calendar month (YYYY-MM), not by day name
   var monthData = {};
   for (var r = 1; r < data.length; r++) {
-    var dateStr = String(data[r][0]).substring(0, 10); // YYYY-MM-DD
-    if (!dateStr || dateStr.length < 7) continue;
-    var monthKey = dateStr.substring(0, 7); // YYYY-MM
+    var rawDate = data[r][0];
+    // Handle both Date objects and strings
+    var dateObj;
+    if (rawDate instanceof Date) {
+      dateObj = rawDate;
+    } else {
+      dateObj = new Date(String(rawDate));
+    }
+    if (isNaN(dateObj.getTime())) continue;
+
+    // Format: YYYY-MM-DD for the day, YYYY-MM for the month key
+    var yyyy = dateObj.getFullYear();
+    var mm = String(dateObj.getMonth() + 1).padStart(2, '0');
+    var dd = String(dateObj.getDate()).padStart(2, '0');
+    var dateStr = yyyy + '-' + mm + '-' + dd;     // YYYY-MM-DD
+    var monthKey = yyyy + '-' + mm;                // YYYY-MM
+
     var trans = Number(data[r][3]) || 0;
     var depl  = Number(data[r][4]) || 0;
+
     if (!monthData[monthKey]) monthData[monthKey] = {};
     if (!monthData[monthKey][dateStr]) monthData[monthKey][dateStr] = { trans: 0, depl: 0 };
     monthData[monthKey][dateStr].trans += trans;
