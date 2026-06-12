@@ -2,35 +2,67 @@ name: Sync MongoDB → MySQL
 
 on:
   schedule:
-    - cron: '0 8-20 * * *'   # Every hour from 08:00 to 20:00 UTC
-  workflow_dispatch:         # Manual trigger for testing
+    # Deployments (Merchant only): every 30 min from 07:00 to 18:00 UTC
+    - cron: '*/30 7-18 * * *'
+    # Transmissions (Google Form): every 15 min, all day
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Sync mode: all | deployments | transmissions'
+        required: false
+        default: 'all'
+
+env:
+  MONGO_URI: ${{ secrets.MONGO_URI }}
+  MONGO_DB_NAME: ${{ secrets.MONGO_DB_NAME }}
+  MYSQL_HOST: ${{ secrets.MYSQL_HOST }}
+  MYSQL_PORT: ${{ secrets.MYSQL_PORT }}
+  MYSQL_USER: ${{ secrets.MYSQL_USER }}
+  MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD }}
+  MYSQL_DATABASE: ${{ secrets.MYSQL_DATABASE }}
+  SSH_HOST: ${{ secrets.SSH_HOST }}
+  SSH_USER: ${{ secrets.SSH_USER }}
+  SSH_PASS: ${{ secrets.SSH_PASS }}
+  SSH_PORT: ${{ secrets.SSH_PORT }}
 
 jobs:
-  sync:
+  # ── Deployment sync: Merchant POS from MongoDB ────────────────────────────
+  sync-deployments:
+    name: Sync Deployments (Merchant)
     runs-on: ubuntu-latest
+    # Run when triggered by the 30-min deployment cron OR manual with mode=all|deployments
+    if: >
+      github.event_name == 'workflow_dispatch' &&
+        (github.event.inputs.mode == 'all' || github.event.inputs.mode == 'deployments') ||
+      github.event_name == 'schedule' &&
+        (github.event.schedule == '*/30 7-18 * * *')
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-
       - name: Install dependencies
-        run: |
-          pip install pandas pymongo sqlalchemy pymysql python-dotenv openpyxl paramiko
+        run: pip install pandas pymongo sqlalchemy pymysql python-dotenv openpyxl paramiko
+      - name: Run deployment sync
+        run: python sync_deployments_to_mysql.py --mode deployments
 
-      - name: Run sync
-        env:
-          MONGO_URI: ${{ secrets.MONGO_URI }}
-          MONGO_DB_NAME: ${{ secrets.MONGO_DB_NAME }}
-          MYSQL_HOST: ${{ secrets.MYSQL_HOST }}
-          MYSQL_PORT: ${{ secrets.MYSQL_PORT }}
-          MYSQL_USER: ${{ secrets.MYSQL_USER }}
-          MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD }}
-          MYSQL_DATABASE: ${{ secrets.MYSQL_DATABASE }}
-          SSH_HOST: ${{ secrets.SSH_HOST }}
-          SSH_USER: ${{ secrets.SSH_USER }}
-          SSH_PASS: ${{ secrets.SSH_PASS }}
-          SSH_PORT: ${{ secrets.SSH_PORT }}
-        run: python sync_deployments_to_mysql.py
+  # ── Transmission sync: Google Form Responses count ────────────────────────
+  sync-transmissions:
+    name: Sync Transmissions (Form)
+    runs-on: ubuntu-latest
+    # Run when triggered by the 15-min cron OR manual with mode=all|transmissions
+    if: >
+      github.event_name == 'workflow_dispatch' &&
+        (github.event.inputs.mode == 'all' || github.event.inputs.mode == 'transmissions') ||
+      github.event_name == 'schedule' &&
+        (github.event.schedule == '*/15 * * * *')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install pandas pymongo sqlalchemy pymysql python-dotenv openpyxl paramiko
+      - name: Run transmission sync
+        run: python sync_deployments_to_mysql.py --mode transmissions

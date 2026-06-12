@@ -487,10 +487,149 @@ function buildReport(offset) {
   var reportSS = getMonthlyReport(range.key);
   writeSummary(reportSS, transmissions, mysqlData, now);
   writeDaily(reportSS, transmissions, mysqlData, now);
+  buildDashboard(reportSS);
   dropDefaultSheet(reportSS);
 
   console.log('[Report ' + range.key + '] OK → ' + reportSS.getUrl());
   return reportSS;
+}
+
+// ─── Dashboard chart sheet ───────────────────────────────────────────────────
+
+var SHEET_DASHBOARD    = 'Dashboard';
+var CHART_COLS_PER_ROW = 3;   // how many month charts per grid row
+var CHART_WIDTH        = 420; // px per chart
+var CHART_HEIGHT       = 280; // px per chart
+var CHART_H_GAP        = 20;  // horizontal gap between charts
+var CHART_V_GAP        = 30;  // vertical gap between rows
+var CHART_TOP_OFFSET   = 60;  // px reserved for dashboard header row
+
+/**
+ * Builds or refreshes the Dashboard sheet inside `reportSS`.
+ * Reads the Daily Details tab for daily totals and draws one combo chart
+ * per month (bar = deployments, line = transmissions), laid out in a grid.
+ *
+ * The chart for a given month is always placed at a fixed grid position
+ * (col = monthIndex % CHART_COLS_PER_ROW, row = floor(monthIndex / CHART_COLS_PER_ROW))
+ * so charts never shuffle when a new month starts.
+ */
+function buildDashboard(reportSS) {
+  var dailySheet = reportSS.getSheetByName(SHEET_DAILY);
+  if (!dailySheet) {
+    console.log('[Dashboard] Daily Details introuvable — skip.');
+    return;
+  }
+
+  var data = dailySheet.getDataRange().getValues();
+  if (data.length < 2) {
+    console.log('[Dashboard] Pas encore de données.');
+    return;
+  }
+
+  // Parse daily data → { 'YYYY-MM' → { date → { trans, depl } } }
+  var monthData = {};
+  for (var r = 1; r < data.length; r++) {
+    var dateStr = String(data[r][0]).substring(0, 10); // YYYY-MM-DD
+    if (!dateStr || dateStr.length < 7) continue;
+    var monthKey = dateStr.substring(0, 7); // YYYY-MM
+    var trans = Number(data[r][3]) || 0;
+    var depl  = Number(data[r][4]) || 0;
+    if (!monthData[monthKey]) monthData[monthKey] = {};
+    if (!monthData[monthKey][dateStr]) monthData[monthKey][dateStr] = { trans: 0, depl: 0 };
+    monthData[monthKey][dateStr].trans += trans;
+    monthData[monthKey][dateStr].depl  += depl;
+  }
+
+  var months = Object.keys(monthData).sort();
+  if (months.length === 0) return;
+
+  var dash = getOrCreateSheet(reportSS, SHEET_DASHBOARD);
+  dash.clear();
+
+  // Header row on the sheet (row 1, cols A-D used as label area)
+  var now = new Date();
+  dash.getRange(1, 1).setValue('TSA Performance — Dashboard')
+      .setFontWeight('bold').setFontSize(14);
+  dash.getRange(1, 1).setNote('Mis à jour : ' + now.toLocaleString('fr-FR'));
+  dash.getRange(1, 1, 1, 6).merge()
+      .setBackground('#1a73e8').setFontColor('#ffffff').setHorizontalAlignment('center');
+  dash.setRowHeight(1, 40);
+
+  // Remove old charts
+  var oldCharts = dash.getCharts();
+  for (var c = 0; c < oldCharts.length; c++) {
+    dash.removeChart(oldCharts[c]);
+  }
+
+  // For each month: write a mini data table starting at a hidden area (row 200+)
+  // then build a chart anchored at the correct grid position.
+  var DATA_START_ROW = 200; // hidden below visible area
+
+  for (var mi = 0; mi < months.length; mi++) {
+    var monthKey = months[mi];
+    var days = Object.keys(monthData[monthKey]).sort();
+
+    // Write mini table: col offset = mi * 4 (Date | Trans | Depl | [spacer])
+    var colOffset = mi * 4 + 1; // 1-based
+    var tableStartRow = DATA_START_ROW;
+
+    // Header
+    dash.getRange(tableStartRow, colOffset, 1, 3)
+        .setValues([['Date', 'Transmissions', 'Deployments']]);
+
+    // Data rows
+    var tableData = days.map(function(d) {
+      return [d, monthData[monthKey][d].trans, monthData[monthKey][d].depl];
+    });
+    if (tableData.length > 0) {
+      dash.getRange(tableStartRow + 1, colOffset, tableData.length, 3)
+          .setValues(tableData);
+    }
+
+    // Chart anchor position (grid)
+    var gridCol = mi % CHART_COLS_PER_ROW;
+    var gridRow = Math.floor(mi / CHART_COLS_PER_ROW);
+    var anchorX  = gridCol * (CHART_WIDTH + CHART_H_GAP) + 10;
+    var anchorY  = CHART_TOP_OFFSET + gridRow * (CHART_HEIGHT + CHART_V_GAP);
+
+    var dataRange = dash.getRange(
+      tableStartRow, colOffset,
+      tableData.length + 1, 3
+    );
+
+    var chart = dash.newChart()
+      .setChartType(Charts.ChartType.COMBO)
+      .addRange(dataRange)
+      .setNumHeaders(1)
+      .setOption('title', monthKey)
+      .setOption('titleTextStyle', { bold: true, fontSize: 12 })
+      .setOption('series', {
+        0: { type: 'bars',  color: '#4a90d9', targetAxisIndex: 0 },
+        1: { type: 'line',  color: '#e67e22', targetAxisIndex: 1,
+             lineWidth: 2, pointSize: 4 }
+      })
+      .setOption('vAxes', {
+        0: { title: 'Deployments', minValue: 0 },
+        1: { title: 'Transmissions', minValue: 0 }
+      })
+      .setOption('hAxis', { slantedText: true, slantedTextAngle: 45 })
+      .setOption('legend', { position: 'bottom' })
+      .setOption('backgroundColor', '#ffffff')
+      .setOption('chartArea', { left: 55, top: 40, width: '75%', height: '60%' })
+      .setPosition(1, 1, anchorX, anchorY)
+      .setOption('width',  CHART_WIDTH)
+      .setOption('height', CHART_HEIGHT)
+      .build();
+
+    dash.insertChart(chart);
+    console.log('[Dashboard] Graphique ' + monthKey + ' positionné (' + gridCol + ',' + gridRow + ').');
+  }
+
+  // Move Dashboard tab to first position for visibility
+  reportSS.setActiveSheet(dash);
+  reportSS.moveActiveSheet(1);
+
+  console.log('[Dashboard] ' + months.length + ' graphique(s) générés.');
 }
 
 // ─── Manual helpers ───────────────────────────────────────────────────────────

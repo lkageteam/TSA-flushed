@@ -1,14 +1,15 @@
 """
 MongoDB → MySQL sync script for TSA deployments.
 
-Reads deployment records from MongoDB `pos` collection for the current month
-and upserts daily counts into MySQL `deployments_daily` table.
-Also refreshes `tsa_reference` from TSA_List.xlsx on each run.
-Runs via GitHub Actions hourly.
+Modes:
+  --mode deployments   Sync Merchant POS deployments from MongoDB (7h-18h UTC)
+  --mode transmissions Refresh tsa_reference from TSA_List.xlsx only
+  --mode all           Both (default)
 
-Usage: python sync_deployments_to_mysql.py
+Usage: python sync_deployments_to_mysql.py [--mode deployments|transmissions|all]
 """
 
+import argparse
 import math
 import select
 import socketserver
@@ -274,15 +275,15 @@ def fetch_mongo_deployments(valid_mongo_ids: set, query_start: datetime, query_e
                 {
                     "createdAt": {"$gte": query_start, "$lte": query_end},
                     "agentId": {"$in": list(valid_mongo_ids)},
+                    "type": "deployment",
+                    "typePos": "Merchant",
                 },
-                {"agentId": 1, "type": 1, "createdAt": 1},
+                {"agentId": 1, "createdAt": 1},
             ).batch_size(10000)
 
             daily_counts = {}
             total_docs = 0
             for doc in cursor:
-                if str(doc.get("type", "")).upper() != "DEPLOYMENT":
-                    continue
                 agent_id = str(doc.get("agentId", "")).strip()
                 created_at = doc.get("createdAt")
                 if not agent_id or not created_at:
@@ -368,10 +369,10 @@ def upsert_deployments(engine, daily_counts: dict, tsa_map: dict):
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
-def main():
+def main(mode: str = "all"):
     start_time = datetime.now()
     print(f"\n{'='*60}")
-    print(f"[START] sync_deployments_to_mysql — {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"[START] sync_deployments_to_mysql [{mode}] — {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*60}\n")
 
     # 1. Build MySQL engine
@@ -394,13 +395,19 @@ def main():
         print("[MySQL] Connexion via tunnel SSH OK.")
 
     try:
-        # 3. Load TSA reference from Excel
+        # 3. Always refresh TSA reference (lightweight, needed by both modes)
         df_tsa = load_tsa_reference()
-
-        # 4. Sync tsa_reference table
         sync_tsa_reference(engine, df_tsa)
 
-        # 5. Build lookup maps
+        if mode == "transmissions":
+            # Transmissions mode: tsa_reference update is all we need here.
+            # The actual transmission counts come from Google Form Responses
+            # and are read directly in AppsScript — nothing more to do in Python.
+            elapsed = (datetime.now() - start_time).total_seconds()
+            print(f"\n[DONE] tsa_reference rafraîchi (mode transmissions) en {elapsed:.1f}s.")
+            return
+
+        # 4. Build lookup maps (deployments mode or all)
         tsa_map = {}
         for _, row in df_tsa.iterrows():
             tsa_map[row["mongo_id"]] = (row["corporate_num"], row["tsa_full_name"], row["region"])
@@ -408,19 +415,19 @@ def main():
         valid_mongo_ids = set(tsa_map.keys())
         print(f"[Info] {len(valid_mongo_ids)} mongo_ids valides pour la requête MongoDB.")
 
-        # 6. Monthly reset if applicable
+        # 5. Monthly reset if applicable
         maybe_reset_previous_month(engine)
 
-        # 7. Date range: start of current month → now
+        # 6. Date range: start of current month → now
         now = datetime.now()
         month_start = datetime(now.year, now.month, 1, 0, 0, 0)
-        print(f"[Info] Plage de requête : {month_start.strftime('%Y-%m-%d')} → {now.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"[Info] Plage : {month_start.strftime('%Y-%m-%d')} → {now.strftime('%Y-%m-%d %H:%M:%S')}")
 
-        # 8. Fetch from MongoDB
-        print("\n[Mongo] Extraction des déploiements …")
+        # 7. Fetch Merchant deployments from MongoDB
+        print("\n[Mongo] Extraction des déploiements Merchant …")
         daily_counts = fetch_mongo_deployments(valid_mongo_ids, month_start, now)
 
-        # 9. Upsert to MySQL
+        # 8. Upsert to MySQL
         print(f"\n[MySQL] Écriture des données …")
         upsert_deployments(engine, daily_counts, tsa_map)
 
@@ -433,4 +440,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="TSA MongoDB → MySQL sync")
+    parser.add_argument(
+        "--mode",
+        choices=["all", "deployments", "transmissions"],
+        default="all",
+        help="Sync mode: all | deployments | transmissions",
+    )
+    args = parser.parse_args()
+    main(mode=args.mode)
