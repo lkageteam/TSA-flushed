@@ -12,8 +12,9 @@ var SHEET_DAILY   = 'Daily Details';
 var REPORTS_FOLDER_NAME = 'TSA Performance Reports';
 var REPORT_NAME_PREFIX  = 'TSA Performance - '; // + YYYY-MM
 
-var MAX_JDBC_ATTEMPTS  = 5;
-var JDBC_BASE_DELAY_MS = 2000;
+var MAX_JDBC_ATTEMPTS  = 9;
+var JDBC_BASE_DELAY_MS = 3000;
+var JDBC_MAX_DELAY_MS  = 20000;
 
 // ─── JDBC helpers ─────────────────────────────────────────────────────────────
 
@@ -31,7 +32,8 @@ function getMySQLConnection() {
       lastError = e;
       console.log('JDBC tentative ' + attempt + '/' + MAX_JDBC_ATTEMPTS + ' échouée : ' + e.message);
       if (attempt === MAX_JDBC_ATTEMPTS) throw lastError;
-      var delay = Math.min(JDBC_BASE_DELAY_MS + (attempt - 1) * 2000, 12000);
+      var delay = Math.min(JDBC_BASE_DELAY_MS + (attempt - 1) * 3000, JDBC_MAX_DELAY_MS);
+      console.log('  Attente ' + delay + 'ms…');
       Utilities.sleep(delay);
     }
   }
