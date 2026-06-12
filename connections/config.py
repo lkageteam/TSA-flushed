@@ -18,8 +18,8 @@ MYSQL_DATABASE = os.getenv("MYSQL_DATABASE", "lka_tsa_deployments")
 # SSH
 SSH_HOST = os.getenv("SSH_HOST", "75.119.154.255")
 SSH_USER = os.getenv("SSH_USER", "root")
-SSH_PASS = os.getenv("SSH_PASS", "8i8Jlnuyz~2cKisB")
-SSH_PORT = int(os.getenv("SSH_PORT", "22"))
+SSH_PASS = os.getenv("SSH_PASS") or "8i8Jlnuyz~2cKisB"
+SSH_PORT = int(os.getenv("SSH_PORT") or "22")
 
 # Tables
 TABLE_DEPLOYMENTS = "deployments_daily"
