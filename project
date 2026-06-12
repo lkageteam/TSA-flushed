@@ -1,0 +1,79 @@
+
+Forms to fetch:
+https://docs.google.com/forms/d/1KzmOV2-kevBknXnJ1eum8POMjgPvD6T8WwwL2EFaiPE/edit#responses
+
+
+Structure du sheet relié auforms
+Timestamp	Email Address	Nom du TSA	Numéro corporate	Region	Nom, Prénoms du partenaire	Registre de commerce	Numéro du partenaire	Secteur d'activité
+6/11/2026 21:30:04	borishounhoui86@gmail.com	HOUNHOUI BORIS 	69397891	ATLANTIQUE	HOUNHOUI BORIS 	23Ab253698	67029830	EDUCATION
+6/11/2026 22:19:37	yawovibonaventure@gmail.com	MONTCHO YAWOVI 	69397865	ATLANTIQUE	MONTCHO YAWOVI 	RB COT 24 A 103879	66877943	AUTRES
+
+lien du sheet : https://docs.google.com/spreadsheets/d/1SkdPVEihCZSHspVtYOcSTl_vgbLniaIhbZL208f8Vv8/edit?resourcekey=&gid=942028112#gid=942028112
+
+
+
+le pattern éprouvé pour se connecter à mysql avec les retries le seul qui marche "D:\LKA\lka_client_pipeline\connections\connect.py"
+
+
+l'exemple de pattern pour avoir les données de mongo sur les deployments(juste y voir sur les deployemnts et leur date selon le tsa) "D:\LKA\LKA_Automations\pipelines\tsa_report\update_tsa_performance.py"
+
+le pattern clair pour se connecter à la base mongo
+"D:\LKA\LKA_Automations\core\db\mongo_client.py"
+
+MONGO_URI=mongodb://lkaBi229:gBLocal24@38.242.195.126:27018/pulse_benin
+MONGO_DB_NAME=pulse_benin
+
+MYSQL_HOST=75.119.154.255
+MYSQL_PORT=3306
+MYSQL_USER=root
+MYSQL_PASSWORD=LkaRoot2025Secure!
+
+maintenant pour le serveur sur lequel on déploiera le petit folder qui fait simplement la mise à jour des données tirées depuis mongo avec le pattern dit plus haut vers une table mysql 
+voici des propositions de pattern pour le diriger depuis ici, il faut y appliquer plein de retries mais c'est ça la base
+
+"D:\LKA\Perf_commissions\deploy_server.py"
+"D:\LKA\Perf_commissions\vps_git_pull_only.py"
+
+
+le ssh du serveur
+# ─── SSH (maintenance) ──────────────────────────────────────────────────────
+PERF_SSH_HOST=75.119.154.255
+PERF_SSH_USER=root
+PERF_SSH_PASS=8i8Jlnuyz~2cKisB
+
+y créer sûrement un nouveau dossier et un cron
+
+
+un pattern pour créer la nouvelle base mysql qui va recevoir les mises à jour(un peu comme les performances) de deployments
+"D:\LKA\lka_client_pipeline\mysql\setup_tsa.py"
+
+un pattern de schéma à crer pour recevoir (la table des deployments done) (ça c'est juste un exemple c'est peut être pas du tout le meilleur pour garder les deployments que mongo nous fournit par date)
+"D:\LKA\Perf_commissions\mysql\setup_db.py"
+
+
+toutes les tables mysql à créer sont clairement pour le profil root et en limitant les accès juste à ce profil, pas d'autre persones en accès
+
+la table liste des tsa à uploader dans mongo en voilà un sample
+TSA ID	Numero Corporate	TSA first Name	TSA Name	TSA Full NAME	Login ID	Numero Corporate2	Region Intern	Region Operateur	DEPARTEMENT	SECTION	RBM	VILLE	LOCALITE
+65b802cb5f4550e109532d47	69397895	ABDOU WAHABOU	OKPE	ABDOU WAHABOU OKPE	69397895	69397895	NORD EST	NORD EST	BORGOU	GRAND NORD	ADJICOUDE BIENVENU	PARAKOU	BORGOU
+65b80c8d5f4550e109532eba	69397770	DJACOTO	FRANCIS	DJACOTO FRANCIS	69397770	69397770	NORD EST	NORD EST	ALIBORI	GRAND NORD	ADJICOUDE BIENVENU	KARIMAMA	ALIBORI
+65b789b95172cccc511be1af	69397779	FABRICE 	KINHOUANDE 	FABRICE KINHOUANDE	69397779	69397779	NORD EST	NORD EST	COLLINES	GRAND NORD	ADJICOUDE BIENVENU	GLAZOUE	COLLINES-EST
+65b78bb65172cccc511be3ea	69397766	PRUDENCE	ADENIRAN	PRUDENCE ADENIRAN	69397766	69397766	NORD EST	NORD EST	BORGOU	GRAND NORD	ADJICOUDE BIENVENU	PARAKOU	BORGOU
+65b782075172cccc511bdf88	69397775	ENANGNON 	HABONOU 	ENANGNON HABONOU	69397775	69397775	NORD EST	NORD EST	BORGOU	GRAND NORD	ADJICOUDE BIENVENU	PARAKOU	BORGOU
+elle nous vient de  "D:\LKA\TSA flushed\TSA_List.xlsx"
+
+
+bon maintenant le travail global c'est de maintenir un sheet au furee tà mesure 
+
+qui présentera le summary du nmobre de transmissions, du nombre de deployments depuis le début du mois
+
+sur une sheet avec les bons sizes de columns, entête bien fait ce tableau suivant
+
+TSA  Region Transmissions Deployments done
+
+les données de transmissions nous viennent du forms lié au sheet dont on avait parlé plus haut(c'est un appscript on va créer donc s'il doit se lier au sheet c'est ça ou bien... d'après la bonne méthode)
+ 
+et un autre sheet détails par jour qui lui aura les tsa pour chaque jour depuisle début du mois
+
+
+God bless us

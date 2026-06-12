@@ -1,0 +1,32 @@
+name: Sync MongoDB → MySQL
+
+on:
+  schedule:
+    - cron: '0 8-20 * * *'   # Every hour from 08:00 to 20:00 UTC
+  workflow_dispatch:         # Manual trigger for testing
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install pandas pymongo sqlalchemy pymysql python-dotenv openpyxl
+
+      - name: Run sync
+        env:
+          MONGO_URI: ${{ secrets.MONGO_URI }}
+          MONGO_DB_NAME: ${{ secrets.MONGO_DB_NAME }}
+          MYSQL_HOST: ${{ secrets.MYSQL_HOST }}
+          MYSQL_PORT: ${{ secrets.MYSQL_PORT }}
+          MYSQL_USER: ${{ secrets.MYSQL_USER }}
+          MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD }}
+          MYSQL_DATABASE: ${{ secrets.MYSQL_DATABASE }}
+        run: python sync_deployments_to_mysql.py
