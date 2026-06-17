@@ -395,8 +395,23 @@ def main(mode: str = "all"):
     engine = get_mysql_engine()
 
     # 2. Test direct connection; fallback to SSH tunnel if needed
+    #    On GitHub Actions, always use SSH tunnel (MySQL bound to 127.0.0.1 on VPS)
     tunnel_ctx = None
-    if not _test_mysql_engine(engine):
+    force_ssh = os.environ.get('GITHUB_ACTIONS') == 'true'
+
+    if force_ssh:
+        print("[GitHub Actions] Tunnel SSH forcé (env détecté).")
+        if paramiko is None:
+            raise RuntimeError("Paramiko non installé, tunnel SSH impossible sur GitHub Actions.")
+        tunnel_ctx = _open_mysql_ssh_tunnel(MYSQL_PORT)
+        local_port = tunnel_ctx.__enter__()
+        print(f"[SSH] Tunnel actif : 127.0.0.1:{local_port} → {SSH_HOST}:{MYSQL_PORT}")
+        engine = _build_mysql_engine("127.0.0.1", local_port)
+        if not _test_mysql_engine(engine):
+            tunnel_ctx.__exit__(None, None, None)
+            raise RuntimeError("MySQL échoué via tunnel SSH.")
+        print("[MySQL] Connexion via tunnel SSH OK.")
+    elif not _test_mysql_engine(engine):
         engine.dispose()
         if paramiko is None:
             raise RuntimeError("MySQL direct échoué et paramiko absent.")
