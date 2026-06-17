@@ -11,6 +11,7 @@ Usage: python sync_deployments_to_mysql.py [--mode deployments|transmissions|all
 
 import argparse
 import math
+import os
 import select
 import socketserver
 import threading
