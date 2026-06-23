@@ -68,6 +68,41 @@ def _is_connection_like_error(exc: Exception) -> bool:
 
 
 # ─── SSH tunnel helpers ───────────────────────────────────────────────────────
+MAX_SSH_ATTEMPTS = 3
+SSH_RETRY_DELAY_S = 10
+
+
+def _connect_ssh_with_retry() -> "paramiko.SSHClient":
+    """Open an SSH connection, retrying on transient auth/network errors."""
+    last_exc: Exception = RuntimeError("No SSH attempt made.")
+    for attempt in range(1, MAX_SSH_ATTEMPTS + 1):
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        try:
+            client.connect(
+                hostname=SSH_HOST,
+                port=SSH_PORT,
+                username=SSH_USER,
+                password=SSH_PASS,
+                timeout=10,
+                auth_timeout=10,
+                banner_timeout=10,
+                look_for_keys=False,
+                allow_agent=False,
+            )
+            return client
+        except Exception as exc:
+            client.close()
+            last_exc = exc
+            if attempt < MAX_SSH_ATTEMPTS:
+                print(
+                    f"[SSH] Tentative {attempt}/{MAX_SSH_ATTEMPTS} échouée "
+                    f"({type(exc).__name__}: {exc}). Retry dans {SSH_RETRY_DELAY_S}s…"
+                )
+                time.sleep(SSH_RETRY_DELAY_S)
+    raise last_exc
+
+
 class _TunnelForwardHandler(socketserver.BaseRequestHandler):
     chain_host = "127.0.0.1"
     chain_port = 3306
@@ -111,19 +146,7 @@ class _ThreadingForwardServer(socketserver.ThreadingTCPServer):
 def _open_mysql_ssh_tunnel(remote_port: int = 3306):
     if paramiko is None:
         raise RuntimeError("Paramiko non installé, tunnel SSH impossible.")
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(
-        hostname=SSH_HOST,
-        port=SSH_PORT,
-        username=SSH_USER,
-        password=SSH_PASS,
-        timeout=10,
-        auth_timeout=10,
-        banner_timeout=10,
-        look_for_keys=False,
-        allow_agent=False,
-    )
+    client = _connect_ssh_with_retry()
     transport = client.get_transport()
     if transport is None:
         client.close()
