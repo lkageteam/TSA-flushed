@@ -162,15 +162,28 @@ function getMonthRange(offset) {
   var now = new Date();
   var start = new Date(now.getFullYear(), now.getMonth() + offset, 1, 0, 0, 0);
   var end   = new Date(now.getFullYear(), now.getMonth() + offset + 1, 1, 0, 0, 0);
-  var key   = start.getFullYear() + '-' + String(start.getMonth() + 1).padStart(2, '0');
+  var key   = start.getFullYear() + '-' + (start.getMonth() + 1 < 10 ? '0' : '') + (start.getMonth() + 1);
   return { start: start, end: end, key: key };
 }
 
 function toDateStr(d) {
   var y = d.getFullYear();
-  var m = String(d.getMonth() + 1).padStart(2, '0');
-  var day = String(d.getDate()).padStart(2, '0');
+  var mVal = d.getMonth() + 1;
+  var dVal = d.getDate();
+  var m = (mVal < 10 ? '0' : '') + mVal;
+  var day = (dVal < 10 ? '0' : '') + dVal;
   return y + '-' + m + '-' + day;
+}
+
+// Helper: find first header index matching any of the given aliases
+function findHeaderIndex(headers, aliases) {
+  for (var i = 0; i < headers.length; i++) {
+    var h = headers[i];
+    for (var a = 0; a < aliases.length; a++) {
+      if (h.indexOf(aliases[a]) !== -1) return i;
+    }
+  }
+  return -1;
 }
 
 // ─── Read transmission data from Form Responses ───────────────────────────────
@@ -185,7 +198,7 @@ function readTransmissions(ss, range) {
   var data = sheet.getDataRange().getValues();
 
   if (data.length < 2) {
-    return { byCorpNum: {}, byDay: {} };
+    return { byCorpNum: {}, byDay: {}, rawRows: [] };
   }
 
   // Find column indices from header row
@@ -209,14 +222,26 @@ function readTransmissions(ss, range) {
     }
   }
 
+  // Detail columns we want to extract
+  var colMap = {
+    tsaName:      findHeaderIndex(headers, ['nom du tsa', 'tsa name', 'tsa']),
+    corpNum:      idxCorpNum,
+    region:       findHeaderIndex(headers, ['region', 'région']),
+    partnerName:  findHeaderIndex(headers, ['nom, prénoms du partenaire', 'nom prenoms', 'partenaire']),
+    regCommerce:  findHeaderIndex(headers, ['registre de commerce', 'registre']),
+    partnerNum:   findHeaderIndex(headers, ['numéro du partenaire', 'numero du partenaire', 'partner number']),
+    sector:       findHeaderIndex(headers, ['secteur d\'activité', 'secteur', 'activity sector'])
+  };
+
   if (idxTimestamp === -1 || idxCorpNum === -1) {
     console.log('WARN: Colonnes Timestamp ou Numéro corporate introuvables dans Form Responses.');
     console.log('Colonnes disponibles : ' + headers.join(', '));
-    return { byCorpNum: {}, byDay: {} };
+    return { byCorpNum: {}, byDay: {}, rawRows: [] };
   }
 
   var byCorpNum = {};
   var byDay = {};
+  var rawRows = [];
 
   for (var row = 1; row < data.length; row++) {
     var rawTs = data[row][idxTimestamp];
@@ -234,10 +259,22 @@ function readTransmissions(ss, range) {
     // Daily count
     var dayKey = toDateStr(ts) + '|' + corpNum;
     byDay[dayKey] = (byDay[dayKey] || 0) + 1;
+
+    // Raw row for Details Transmission
+    rawRows.push({
+      timestamp:    ts,
+      tsaName:      colMap.tsaName >= 0 ? String(data[row][colMap.tsaName] || '') : '',
+      corpNum:      corpNum,
+      region:       colMap.region >= 0 ? String(data[row][colMap.region] || '') : '',
+      partnerName:  colMap.partnerName >= 0 ? String(data[row][colMap.partnerName] || '') : '',
+      regCommerce:  colMap.regCommerce >= 0 ? String(data[row][colMap.regCommerce] || '') : '',
+      partnerNum:   colMap.partnerNum >= 0 ? String(data[row][colMap.partnerNum] || '') : '',
+      sector:       colMap.sector >= 0 ? String(data[row][colMap.sector] || '') : ''
+    });
   }
 
   console.log('Transmissions lues : ' + Object.keys(byCorpNum).length + ' TSA uniques.');
-  return { byCorpNum: byCorpNum, byDay: byDay };
+  return { byCorpNum: byCorpNum, byDay: byDay, rawRows: rawRows };
 }
 
 // ─── Read MySQL deployment data ───────────────────────────────────────────────
@@ -341,7 +378,7 @@ function styleSheet(sheet, numRows, numCols, numericCols, widths, updatedAt) {
 
   // Base font on the whole used range
   var used = sheet.getRange(1, 1, Math.max(numRows, 1), numCols);
-  used.setFontFamily('Arial').setFontSize(10).setVerticalAlignment('middle');
+  used.setFontFamily('Roboto').setFontSize(10).setVerticalAlignment('middle');
 
   // Header row
   var header = sheet.getRange(1, 1, 1, numCols);
@@ -378,6 +415,44 @@ function styleSheet(sheet, numRows, numCols, numericCols, widths, updatedAt) {
   if (updatedAt) {
     sheet.getRange(1, 1).setNote('Mis à jour : ' + updatedAt.toLocaleString('fr-FR'));
   }
+}
+
+// ─── Write Transmission Details tab ───────────────────────────────────────────
+
+var SHEET_TRANSMISSIONS = 'Details Transmission';
+
+function writeTransmissionDetails(reportSS, rawRows, updatedAt) {
+  var rows = [['Date', 'Nom du TSA', 'Numéro corporate', 'Region',
+               'Nom, Prénoms du partenaire', 'Registre de commerce',
+               'Numéro du partenaire', 'Secteur d\'activité']];
+
+  rawRows.forEach(function(r) {
+    rows.push([
+      r.timestamp,
+      r.tsaName,
+      r.corpNum,
+      r.region,
+      r.partnerName,
+      r.regCommerce,
+      r.partnerNum,
+      r.sector
+    ]);
+  });
+
+  var sheet = getOrCreateSheet(reportSS, SHEET_TRANSMISSIONS);
+  sheet.clear();
+  sheet.getRange(1, 1, rows.length, 8).setValues(rows);
+
+  styleSheet(
+    sheet, rows.length, 8,
+    [], // no numeric columns to center
+    [{ col: 1, width: 140 }, { col: 2, width: 220 }, { col: 3, width: 130 },
+     { col: 4, width: 110 }, { col: 5, width: 220 }, { col: 6, width: 160 },
+     { col: 7, width: 160 }, { col: 8, width: 140 }],
+    updatedAt
+  );
+
+  console.log('[Details Transmission] ' + (rows.length - 1) + ' lignes écrites.');
 }
 
 // ─── Write Summary (Monthly) tab ──────────────────────────────────────────────
@@ -505,6 +580,7 @@ function buildReport(offset) {
   var reportSS = getMonthlyReport(range.key);
   writeSummary(reportSS, transmissions, mysqlData, now);
   writeDaily(reportSS, transmissions, mysqlData, now);
+  writeTransmissionDetails(reportSS, transmissions.rawRows, now);
   buildDashboard(reportSS);
   dropDefaultSheet(reportSS);
 
@@ -560,8 +636,10 @@ function buildDashboard(reportSS) {
 
     // Format: YYYY-MM-DD for the day, YYYY-MM for the month key
     var yyyy = dateObj.getFullYear();
-    var mm = String(dateObj.getMonth() + 1).padStart(2, '0');
-    var dd = String(dateObj.getDate()).padStart(2, '0');
+    var mVal = dateObj.getMonth() + 1;
+    var dVal = dateObj.getDate();
+    var mm = (mVal < 10 ? '0' : '') + mVal;
+    var dd = (dVal < 10 ? '0' : '') + dVal;
     var dateStr = yyyy + '-' + mm + '-' + dd;     // YYYY-MM-DD
     var monthKey = yyyy + '-' + mm;                // YYYY-MM
 
