@@ -68,8 +68,21 @@ def _is_connection_like_error(exc: Exception) -> bool:
 
 
 # ─── SSH tunnel helpers ───────────────────────────────────────────────────────
-MAX_SSH_ATTEMPTS = 3
-SSH_RETRY_DELAY_S = 10
+MAX_SSH_ATTEMPTS   = 7
+SSH_RETRY_BASE_S   = 5
+SSH_RETRY_MAX_S    = 30
+
+MYSQL_ATTEMPTS     = 7
+MYSQL_RETRY_BASE_S = 3
+MYSQL_RETRY_MAX_S  = 20
+
+
+def _ssh_retry_delay(attempt: int) -> float:
+    return min(SSH_RETRY_MAX_S, SSH_RETRY_BASE_S + (attempt - 1) * 5)
+
+
+def _mysql_retry_delay(attempt: int) -> float:
+    return min(MYSQL_RETRY_MAX_S, MYSQL_RETRY_BASE_S + (attempt - 1) * 3)
 
 
 def _connect_ssh_with_retry() -> "paramiko.SSHClient":
@@ -95,12 +108,33 @@ def _connect_ssh_with_retry() -> "paramiko.SSHClient":
             client.close()
             last_exc = exc
             if attempt < MAX_SSH_ATTEMPTS:
+                delay = _ssh_retry_delay(attempt)
                 print(
                     f"[SSH] Tentative {attempt}/{MAX_SSH_ATTEMPTS} échouée "
-                    f"({type(exc).__name__}: {exc}). Retry dans {SSH_RETRY_DELAY_S}s…"
+                    f"({type(exc).__name__}: {exc}). Retry dans {delay:.0f}s…"
                 )
-                time.sleep(SSH_RETRY_DELAY_S)
+                time.sleep(delay)
     raise last_exc
+
+
+def _with_mysql_retry(fn, *args, label: str = "opération MySQL", **kwargs):
+    """Call fn(*args, **kwargs), retrying up to MYSQL_ATTEMPTS times on any exception."""
+    last_exc: Exception = RuntimeError("No MySQL attempt made.")
+    for attempt in range(1, MYSQL_ATTEMPTS + 1):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:
+            last_exc = exc
+            if attempt < MYSQL_ATTEMPTS:
+                delay = _mysql_retry_delay(attempt)
+                print(
+                    f"[MySQL] {label} tentative {attempt}/{MYSQL_ATTEMPTS} échouée "
+                    f"({type(exc).__name__}: {exc}). Retry dans {delay:.0f}s…"
+                )
+                time.sleep(delay)
+    raise RuntimeError(
+        f"[MySQL] {label} échouée après {MYSQL_ATTEMPTS} tentatives."
+    ) from last_exc
 
 
 class _TunnelForwardHandler(socketserver.BaseRequestHandler):
@@ -452,7 +486,7 @@ def main(mode: str = "all"):
     try:
         # 3. Always refresh TSA reference (lightweight, needed by both modes)
         df_tsa = load_tsa_reference()
-        sync_tsa_reference(engine, df_tsa)
+        _with_mysql_retry(sync_tsa_reference, engine, df_tsa, label="sync_tsa_reference")
 
         if mode == "transmissions":
             # Transmissions mode: tsa_reference update is all we need here.
@@ -471,7 +505,7 @@ def main(mode: str = "all"):
         print(f"[Info] {len(valid_mongo_ids)} mongo_ids valides pour la requête MongoDB.")
 
         # 5. Monthly reset if applicable
-        maybe_reset_previous_month(engine)
+        _with_mysql_retry(maybe_reset_previous_month, engine, label="maybe_reset_previous_month")
 
         # 6. Date range: start of current month → now
         now = datetime.now()
@@ -484,7 +518,7 @@ def main(mode: str = "all"):
 
         # 8. Upsert to MySQL
         print(f"\n[MySQL] Écriture des données …")
-        upsert_deployments(engine, daily_counts, tsa_map, month_start, now)
+        _with_mysql_retry(upsert_deployments, engine, daily_counts, tsa_map, month_start, now, label="upsert_deployments")
 
         elapsed = (datetime.now() - start_time).total_seconds()
         print(f"\n[DONE] Sync terminé en {elapsed:.1f}s.")
