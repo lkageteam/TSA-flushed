@@ -12,27 +12,30 @@ var SHEET_DAILY   = 'Daily Details';
 var REPORTS_FOLDER_NAME = 'TSA Performance Reports';
 var REPORT_NAME_PREFIX  = 'TSA Performance - '; // + YYYY-MM
 
-var MAX_JDBC_ATTEMPTS  = 9;
-var JDBC_BASE_DELAY_MS = 3000;
-var JDBC_MAX_DELAY_MS  = 20000;
+var MAX_JDBC_ATTEMPTS  = 3;         // fail fast — MySQL injoignable = exit en < 30 s
+var JDBC_BASE_DELAY_MS = 2000;
+var JDBC_MAX_DELAY_MS  = 8000;
+var MAX_EXEC_MS        = 5 * 60 * 1000 + 30 * 1000; // 5 min 30 s — marge avant la limite dure de 6 min
 
 // ─── JDBC helpers ─────────────────────────────────────────────────────────────
 
-function getMySQLConnection() {
+function getMySQLConnection(startTime) {
+  // connectTimeout=5000 : échoue en 5 s max au lieu d'attendre le timeout TCP (~2 min)
+  var url = 'jdbc:mysql://' + MYSQL_HOST + ':' + MYSQL_PORT + '/' + MYSQL_DATABASE
+          + '?connectTimeout=5000&socketTimeout=30000';
   var lastError = null;
   for (var attempt = 1; attempt <= MAX_JDBC_ATTEMPTS; attempt++) {
+    if (startTime && Date.now() - startTime > MAX_EXEC_MS - 30000) {
+      throw new Error('TIMEOUT');
+    }
     try {
-      var conn = Jdbc.getConnection(
-        'jdbc:mysql://' + MYSQL_HOST + ':' + MYSQL_PORT + '/' + MYSQL_DATABASE,
-        MYSQL_USER,
-        MYSQL_PASSWORD
-      );
+      var conn = Jdbc.getConnection(url, MYSQL_USER, MYSQL_PASSWORD);
       return conn;
     } catch (e) {
       lastError = e;
       console.log('JDBC tentative ' + attempt + '/' + MAX_JDBC_ATTEMPTS + ' échouée : ' + e.message);
       if (attempt === MAX_JDBC_ATTEMPTS) throw lastError;
-      var delay = Math.min(JDBC_BASE_DELAY_MS + (attempt - 1) * 3000, JDBC_MAX_DELAY_MS);
+      var delay = Math.min(JDBC_BASE_DELAY_MS + (attempt - 1) * 2000, JDBC_MAX_DELAY_MS);
       console.log('  Attente ' + delay + 'ms…');
       Utilities.sleep(delay);
     }
@@ -285,12 +288,12 @@ function readTransmissions(ss, range) {
  *   deploymentsByDay     : { "YYYY-MM-DD|corporateNum" → count }
  *   tsaInfo              : { corporateNum → { name, region } }
  */
-function readMySQLData(range) {
+function readMySQLData(range, startTime) {
   var startStr = toDateStr(range.start);
   var endStr   = toDateStr(range.end);
   var conn = null;
   try {
-    conn = getMySQLConnection();
+    conn = getMySQLConnection(startTime);
 
     // Query 1: deployments summary (month range)
     var sqlDeplSummary =
@@ -569,19 +572,23 @@ function writeDaily(reportSS, transmissions, mysqlData, updatedAt) {
  * from MySQL, then writes the Summary + Daily tabs into the month's dedicated
  * spreadsheet stored in the Drive reports folder.
  */
-function buildReport(offset) {
+function buildReport(offset, startTime) {
   var range  = getMonthRange(offset);
   var source = SpreadsheetApp.getActiveSpreadsheet();
   var now    = new Date();
 
   var transmissions = readTransmissions(source, range);
-  var mysqlData     = readMySQLData(range);
+  var mysqlData     = readMySQLData(range, startTime);
 
   var reportSS = getMonthlyReport(range.key);
   writeSummary(reportSS, transmissions, mysqlData, now);
   writeDaily(reportSS, transmissions, mysqlData, now);
   writeTransmissionDetails(reportSS, transmissions.rawRows, now);
-  buildDashboard(reportSS);
+  if (!startTime || Date.now() - startTime < MAX_EXEC_MS - 60000) {
+    buildDashboard(reportSS);
+  } else {
+    console.log('[Dashboard] Skip — approche du timeout (>4 min 30 s écoulés).');
+  }
   dropDefaultSheet(reportSS);
 
   console.log('[Report ' + range.key + '] OK → ' + reportSS.getUrl());
@@ -746,30 +753,29 @@ function buildDashboard(reportSS) {
 
 // ─── Manual helpers ───────────────────────────────────────────────────────────
 
-function updateCurrentMonth()    { return buildReport(0);  }
-function finalizePreviousMonth() { return buildReport(-1); }
+function updateCurrentMonth()    { return buildReport(0,  Date.now()); }
+function finalizePreviousMonth() { return buildReport(-1, Date.now()); }
 
 // ─── Main entry point (called by trigger) ────────────────────────────────────
 
 function runUpdate() {
+  var startTime = Date.now();
   try {
-    // Always refresh the current month (auto-creates a new spreadsheet when
-    // the month rolls over).
-    buildReport(0);
+    buildReport(0, startTime);
 
-    // During the first 3 days of a new month, finalize the previous month's
-    // report so late-arriving data is captured before we stop touching it.
     var now = new Date();
-    if (now.getDate() <= 3) {
-      buildReport(-1);
+    if (now.getDate() <= 3 && Date.now() - startTime < MAX_EXEC_MS - 60000) {
+      buildReport(-1, startTime);
       console.log('[Finalize] Rapport du mois précédent finalisé.');
     }
 
     console.log('[DONE] Mise à jour terminée avec succès.');
   } catch (e) {
+    if (e.message === 'TIMEOUT') {
+      console.log('⏱️ Timeout détecté — arrêt propre, reprise au prochain déclenchement.');
+      return;
+    }
     console.error('[ERROR] runUpdate failed: ' + e.message + '\n' + e.stack);
-    // Optionally send email on error
-    // MailApp.sendEmail('your@email.com', 'TSA Sheet Error', e.message + '\n' + e.stack);
   }
 }
 
