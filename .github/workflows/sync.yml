@@ -24,6 +24,9 @@ env:
   SSH_HOST: ${{ secrets.SSH_HOST }}
   SSH_USER: ${{ secrets.SSH_USER }}
   SSH_PASS: ${{ secrets.SSH_PASS }}
+  # Cle ed25519 preferee au mot de passe (fenetres de refus cote VPS,
+  # cf. D:\LKA\MYSQL_CONNECTION_METHODS.md par.6)
+  SSH_PKEY: ${{ secrets.SSH_PKEY }}
   SSH_PORT: ${{ secrets.SSH_PORT }}
 
 jobs:

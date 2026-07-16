@@ -1,0 +1,38 @@
+name: Auto Retry Sync
+
+# Relance automatiquement un run de sync qui a echoue, sur un runner NEUF
+# (= nouvelle IP, quelques minutes plus tard). Replique du mecanisme de
+# lka-bi-pipeline (commit 25fe329) : le VPS traverse des fenetres de refus
+# d'authentification de quelques minutes (saturation sshd par brute-force
+# botnet, mesure le 2026-07-16 : ~10 700 'Failed password'/48h, pas de
+# fail2ban) - insister depuis le meme runner ne marche jamais, rejouer le
+# job un peu plus tard reussit. Details :
+# D:\LKA\MYSQL_CONNECTION_METHODS.md par.6.
+on:
+  workflow_run:
+    workflows: ["Sync MongoDB → MySQL"]
+    types: [completed]
+
+permissions:
+  actions: write
+
+jobs:
+  retry:
+    runs-on: ubuntu-latest
+    # 1 run initial + 2 relances max : au-dela, vraie panne serveur, on
+    # laisse le cron suivant (15-30 min) reprendre.
+    if: >
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.run_attempt < 3
+    steps:
+      - name: Attendre puis relancer les jobs echoues
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "Run $RUN_ID echoue (tentative $ATTEMPT). Relance dans 3 min..."
+          sleep 180
+          gh run rerun "$RUN_ID" --failed --repo "$REPO"
+          echo "Relance demandee (tentative $((ATTEMPT + 1)))."

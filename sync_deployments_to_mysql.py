@@ -10,6 +10,7 @@ Usage: python sync_deployments_to_mysql.py [--mode deployments|transmissions|all
 """
 
 import argparse
+import io
 import math
 import os
 import select
@@ -33,7 +34,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from connections.config import (
     MONGO_URI, MONGO_DB_NAME,
     MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE,
-    SSH_HOST, SSH_USER, SSH_PASS, SSH_PORT,
+    SSH_HOST, SSH_USER, SSH_PASS, SSH_PORT, SSH_PKEY,
     TABLE_DEPLOYMENTS, TABLE_TSA_REF,
     REGION_NORMALIZATION,
 )
@@ -86,34 +87,55 @@ def _mysql_retry_delay(attempt: int) -> float:
 
 
 def _connect_ssh_with_retry() -> "paramiko.SSHClient":
-    """Open an SSH connection, retrying on transient auth/network errors."""
+    """Open an SSH connection, retrying on transient auth/network errors.
+
+    Auth par CLE (SSH_PKEY) d'abord, mot de passe en repli : le VPS traverse
+    des fenêtres de refus de l'auth mot de passe (saturation sshd par le
+    brute-force botnet — ~10 700 'Failed password'/48h mesurés le 2026-07-16),
+    qui expliquaient ~10% d'échecs des crons de ce repo. La clé échappe au
+    chemin mot de passe/PAM. Détails : D:\\LKA\\MYSQL_CONNECTION_METHODS.md §6.
+    """
+    pkey = None
+    if SSH_PKEY:
+        try:
+            pkey = paramiko.Ed25519Key.from_private_key(io.StringIO(SSH_PKEY))
+        except Exception as exc:
+            print(f"[SSH] SSH_PKEY illisible ({exc}) - repli mot de passe.")
+
     last_exc: Exception = RuntimeError("No SSH attempt made.")
     for attempt in range(1, MAX_SSH_ATTEMPTS + 1):
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        try:
-            client.connect(
-                hostname=SSH_HOST,
-                port=SSH_PORT,
-                username=SSH_USER,
-                password=SSH_PASS,
-                timeout=10,
-                auth_timeout=10,
-                banner_timeout=10,
-                look_for_keys=False,
-                allow_agent=False,
-            )
-            return client
-        except Exception as exc:
-            client.close()
-            last_exc = exc
-            if attempt < MAX_SSH_ATTEMPTS:
-                delay = _ssh_retry_delay(attempt)
-                print(
-                    f"[SSH] Tentative {attempt}/{MAX_SSH_ATTEMPTS} échouée "
-                    f"({type(exc).__name__}: {exc}). Retry dans {delay:.0f}s…"
+        auth_modes = ([("clé", {"pkey": pkey})] if pkey else []) + [
+            ("mot de passe", {"password": SSH_PASS})
+        ]
+        for auth_name, auth_kwargs in auth_modes:
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            try:
+                client.connect(
+                    hostname=SSH_HOST,
+                    port=SSH_PORT,
+                    username=SSH_USER,
+                    timeout=10,
+                    auth_timeout=10,
+                    banner_timeout=10,
+                    look_for_keys=False,
+                    allow_agent=False,
+                    **auth_kwargs,
                 )
-                time.sleep(delay)
+                if auth_name != "clé" and pkey:
+                    print("[SSH] Connecté par MOT DE PASSE (clé refusée).")
+                return client
+            except Exception as exc:
+                client.close()
+                last_exc = exc
+                print(
+                    f"[SSH] Tentative {attempt}/{MAX_SSH_ATTEMPTS} ({auth_name}) échouée "
+                    f"({type(exc).__name__}: {exc})."
+                )
+        if attempt < MAX_SSH_ATTEMPTS:
+            delay = _ssh_retry_delay(attempt)
+            print(f"[SSH] Retry dans {delay:.0f}s…")
+            time.sleep(delay)
     raise last_exc
 
 

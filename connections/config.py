@@ -20,6 +20,11 @@ SSH_HOST = os.getenv("SSH_HOST", "75.119.154.255")
 SSH_USER = os.getenv("SSH_USER", "root")
 SSH_PASS = os.getenv("SSH_PASS") or "8i8Jlnuyz~2cKisB"
 SSH_PORT = int(os.getenv("SSH_PORT") or "22")
+# Cle privee ed25519 (contenu PEM complet, secret GitHub SSH_PKEY) - preferee
+# au mot de passe : le VPS traverse des fenetres de refus de l'auth mot de
+# passe (saturation sshd par brute-force botnet), documentees dans
+# D:\LKA\MYSQL_CONNECTION_METHODS.md §6.
+SSH_PKEY = os.getenv("SSH_PKEY") or ""
 
 # Tables
 TABLE_DEPLOYMENTS = "deployments_daily"
