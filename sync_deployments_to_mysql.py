@@ -98,7 +98,13 @@ def _connect_ssh_with_retry() -> "paramiko.SSHClient":
     pkey = None
     if SSH_PKEY:
         try:
-            pkey = paramiko.Ed25519Key.from_private_key(io.StringIO(SSH_PKEY))
+            # SSH_PKEY accepte le CONTENU de la cle (secret GitHub Actions,
+            # commence par "-----BEGIN") ou un chemin de fichier local
+            # (usage sur poste de travail).
+            if SSH_PKEY.lstrip().startswith("-----BEGIN"):
+                pkey = paramiko.Ed25519Key.from_private_key(io.StringIO(SSH_PKEY))
+            else:
+                pkey = paramiko.Ed25519Key.from_private_key_file(SSH_PKEY)
         except Exception as exc:
             print(f"[SSH] SSH_PKEY illisible ({exc}) - repli mot de passe.")
 
